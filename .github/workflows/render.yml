@@ -1,0 +1,62 @@
+name: Render video
+on:
+  push:
+    paths: ['videos/*.html', 'videos/*.zip']
+  workflow_dispatch:
+    inputs:
+      html: {description: 'HTML file in videos/ (blank = newest)', required: false, default: ''}
+      fps: {description: 'Frames per second', required: false, default: '30'}
+env:
+  PARTS: 10
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    outputs: {html: '${{ steps.p.outputs.html }}', fps: '${{ steps.p.outputs.fps }}'}
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 2}
+      - id: p
+        run: |
+          H="${{ github.event.inputs.html }}"
+          if [ -z "$H" ]; then H=$(git diff --name-only HEAD~1 HEAD -- 'videos/*.html' 'videos/*.zip' 2>/dev/null | tail -1); fi
+          if [ -z "$H" ]; then H=$(ls -t videos/*.html videos/*.zip 2>/dev/null | head -1); fi
+          H="${H%.zip}"; H="${H%.html}.html"
+          case "$H" in videos/*) ;; *) H="videos/$H";; esac
+          echo "html=$H" >> $GITHUB_OUTPUT; echo "fps=${{ github.event.inputs.fps || '30' }}" >> $GITHUB_OUTPUT; echo "Rendering $H"
+  frames:
+    needs: pick
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy: {fail-fast: true, matrix: {part: [0,1,2,3,4,5,6,7,8,9]}}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cd videos && for z in *.zip; do [ -e "$z" ] && unzip -o -q "$z"; done; ls -la
+      - run: pip install -q playwright && sudo apt-get -qq update && sudo apt-get -qq install -y ffmpeg fonts-noto-color-emoji >/dev/null
+      - run: python3 render.py "${{ needs.pick.outputs.html }}" --part ${{ matrix.part }} --parts $PARTS --fps ${{ needs.pick.outputs.fps }} -o seg${{ matrix.part }}.mp4
+      - uses: actions/upload-artifact@v4
+        with: {name: 'seg${{ matrix.part }}', path: 'seg${{ matrix.part }}.mp4', retention-days: 1}
+  audio:
+    needs: pick
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cd videos && for z in *.zip; do [ -e "$z" ] && unzip -o -q "$z"; done; ls -la
+      - run: pip install -q playwright && sudo apt-get -qq update && sudo apt-get -qq install -y ffmpeg >/dev/null
+      - run: python3 render.py "${{ needs.pick.outputs.html }}" --audio --fps ${{ needs.pick.outputs.fps }} -o mix.wav && ffmpeg -v error -i mix.wav -c:a aac -b:a 192k mix.m4a
+      - uses: actions/upload-artifact@v4
+        with: {name: audio, path: mix.m4a, retention-days: 1}
+  join:
+    needs: [pick, frames, audio]
+    runs-on: ubuntu-latest
+    permissions: {contents: write}
+    steps:
+      - uses: actions/download-artifact@v4
+      - run: |
+          sudo apt-get -qq update && sudo apt-get -qq install -y ffmpeg >/dev/null
+          for i in $(seq 0 $((PARTS-1))); do echo "file 'seg$i/seg$i.mp4'"; done > list.txt
+          ffmpeg -v error -f concat -safe 0 -i list.txt -c copy video.mp4
+          N=$(basename "${{ needs.pick.outputs.html }}" .html)
+          ffmpeg -v error -i video.mp4 -i audio/mix.m4a -map 0:v -map 1:a -c copy -shortest -movflags +faststart "$N.mp4"
+          ls -lh "$N.mp4"; echo "N=$N" >> $GITHUB_ENV
+      - env: {GH_TOKEN: '${{ github.token }}'}
+        run: gh release create "render-${{ github.run_number }}" "$N.mp4" --repo "${{ github.repository }}" --title "$N" --notes "Rendered from ${{ needs.pick.outputs.html }}"
